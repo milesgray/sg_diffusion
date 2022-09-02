@@ -1,18 +1,106 @@
 import importlib
-
-import torch
-import numpy as np
 from collections import abc
-from einops import rearrange
 from functools import partial
-
 import multiprocessing as mp
 from threading import Thread
 from queue import Queue
-
 from inspect import isfunction
+
+import torch
+from torchvision.transforms import functional as TF
+import numpy as np
+from einops import rearrange
 from PIL import Image, ImageDraw, ImageFont
 
+
+def isnan(tensor):
+    return (tensor != tensor)
+
+def ismap(x):
+    if not isinstance(x, torch.Tensor):
+        return False
+    return (len(x.shape) == 4) and (x.shape[1] > 3)
+
+def isimage(x):
+    if not isinstance(x, torch.Tensor):
+        return False
+    return (len(x.shape) == 4) and (x.shape[1] == 3 or x.shape[1] == 1)
+
+def exists(x):
+    return x is not None
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
+
+def tensor2numpy(x):
+    if x.is_cuda:
+        x = x.cpu()
+    if tens.requires_grad:
+        x = x.detach()
+    return x.numpy()
+
+def t2n(x):
+    if isinstance(x, np.ndarray):
+        return x
+    elif isinstance(x, list):
+        return np.array(tens)
+    elif isinstance(x, float) or isinstance(x, int):
+        return np.array([x])
+    else:
+        return tensor2numpy(x)
+
+def mean_flat(tensor):
+    """
+    https://github.com/openai/guided-diffusion/blob/27c20a8fab9cb472df5d6bdd6c8d11c8f430b924/guided_diffusion/nn.py#L86
+    Take the mean over all non-batch dimensions.
+    """
+    return tensor.mean(dim=list(range(1, len(tensor.shape))))
+
+def grad_vals(m):
+    ps = []
+    for p in m.parameters():
+        if p.grad is not None:
+            ps.append(p.grad.data.view(-1))
+    ps = t.cat(ps)
+    return ps.mean().item(), ps.std(), ps.abs().mean(), \
+        ps.abs().std(), ps.abs().min(), ps.abs().max()
+
+
+def count_params(model, verbose=False):
+    total_params = sum(p.numel() for p in model.parameters())
+    if verbose:
+        print(f"{model.__class__.__name__} has {total_params * 1.e-6:.2f} M params.")
+    return total_params
+
+
+def fetch(url_or_path):
+    """Fetches a file from an HTTP or HTTPS url, or opens the local file."""
+    if str(url_or_path).startswith('http://') or str(url_or_path).startswith('https://'):
+        r = requests.get(url_or_path)
+        r.raise_for_status()
+        fd = io.BytesIO()
+        fd.write(r.content)
+        fd.seek(0)
+        return fd
+    return open(url_or_path, 'rb')
+
+def from_pil_image(x):
+    """Converts from a PIL image to a tensor."""
+    x = TF.to_tensor(x)
+    if x.ndim == 2:
+        x = x[..., None]
+    return x * 2 - 1
+
+def to_pil_image(x):
+    """Converts from a tensor to a PIL image."""
+    if x.ndim == 4:
+        assert x.shape[0] == 1
+        x = x[0]
+    if x.shape[0] == 1:
+        x = x[0]
+    return TF.to_pil_image((x.clamp(-1, 1) + 1) / 2)
 
 def log_txt_as_img(wh, xc, size=10):
     # wh a tuple of (width, height)
@@ -36,44 +124,6 @@ def log_txt_as_img(wh, xc, size=10):
     txts = np.stack(txts)
     txts = torch.tensor(txts)
     return txts
-
-
-def ismap(x):
-    if not isinstance(x, torch.Tensor):
-        return False
-    return (len(x.shape) == 4) and (x.shape[1] > 3)
-
-
-def isimage(x):
-    if not isinstance(x, torch.Tensor):
-        return False
-    return (len(x.shape) == 4) and (x.shape[1] == 3 or x.shape[1] == 1)
-
-
-def exists(x):
-    return x is not None
-
-
-def default(val, d):
-    if exists(val):
-        return val
-    return d() if isfunction(d) else d
-
-
-def mean_flat(tensor):
-    """
-    https://github.com/openai/guided-diffusion/blob/27c20a8fab9cb472df5d6bdd6c8d11c8f430b924/guided_diffusion/nn.py#L86
-    Take the mean over all non-batch dimensions.
-    """
-    return tensor.mean(dim=list(range(1, len(tensor.shape))))
-
-
-def count_params(model, verbose=False):
-    total_params = sum(p.numel() for p in model.parameters())
-    if verbose:
-        print(f"{model.__class__.__name__} has {total_params * 1.e-6:.2f} M params.")
-    return total_params
-
 
 def instantiate_from_config(config):
     if not "target" in config:
