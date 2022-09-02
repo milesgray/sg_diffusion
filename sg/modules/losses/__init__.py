@@ -1,0 +1,1 @@
+from sg.modules.losses.contperceptual import LPIPSWithDiscriminator
