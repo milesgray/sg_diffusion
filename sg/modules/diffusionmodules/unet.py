@@ -409,7 +409,6 @@ class QKVAttention(nn.Module):
     def count_flops(model, _x, y):
         return count_flops_attn(model, _x, y)
 
-
 class UNetModel(nn.Module):
     """
     The full UNet model with attention and timestep embedding.
@@ -740,7 +739,6 @@ class UNetModel(nn.Module):
             return self.id_predictor(h)
         else:
             return self.out(h)
-
 
 class EncoderUNetModel(nn.Module):
     """

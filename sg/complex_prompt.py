@@ -1,34 +1,68 @@
-#@title Complex Prompt
-def get_prompt_map(prompt, model=model):
-    tokenizer = model.cond_stage_model.tokenizer
-    encoding = tokenizer(prompt,  truncation=True, max_length=77, return_length=True,
-                                return_overflowing_tokens=False, padding="max_length", return_tensors="pt")
-    tokens = encoding["input_ids"].squeeze()
-    prompt_map = [tokenizer.decode(id) for id in encoding["input_ids"].squeeze()]
-    return prompt_map
+from typing import Union
+from collections import defaultdict
+
+import torch
+
 
 class ComplexPromptEmbedding:
-    def __init__(self, prompt: str, scale: float=1.0, mask=None, model=model):
-        self.scale = scale if scale else 1.0
-        self.mask = mask if mask else 1.0
-        self.prompt = prompt
-        self.token_map = get_prompt_map(prompt, model=model)
-        self.model = model
-        self.tokenizer = model.cond_stage_model.tokenizer
-        self._raw_embeddings = self._get_conditioning_embeddings()
-        self.embeddings = self._raw_embeddings.clone()
-        self.path = []
-        self.path_embeddings = []
-        self.path_history = []
+    def __init__(self, prompt: Union[list,str], scale: float=1.0, 
+                 mask=None, 
+                 model=model,
+                 logger=print):        
+        if isinstance(prompt, ComplexPromptEmbedding):
+            self._copy_other(prompt)
+        else:
+            self.parent = None
+            self.log = logger        
+            self.scale = scale if scale else 1.0
+            self.mask = mask if mask else 1.0
+            while isinstance(prompt, list):
+                prompt = prompt[0]
+            self.prompt = prompt if isinstance(prompt, str) else str(prompt)                
+            self.model = model
+            self.tokenizer = model.cond_stage_model.tokenizer
+            self._origin_embeddings = self._get_conditioning_embeddings()
+            self.embeddings = self._origin_embeddings.clone()
+            self.token_map = self._get_prompt_map()
+            self.trend_map = self._get_index_trend_map()            
+            self.path = []
+            self.path_embeddings = []
+            self.path_history = []
         self.built = False
-        self.trend_map = self._build_index_trend_map()
-
+        
+    def _copy_other(self, other):
+        self.parent = other
+        self.prompt = other.prompt
+        self.log = other.log
+        self.scale = other.scale
+        self.mask = other.mask
+        self.model = other.model
+        self.tokenizer = other.tokenizer            
+        self._origin_embeddings = other._origin_embeddings
+        self.embeddings = other.get_embeddings()
+        self.trend_map = other.trend_map
+        self.token_map = other.token_map
+        self.path = other.path
+        self.path_embeddings = other.path_embeddings
+        self.path_history = other.path_history
+        
     def _get_conditioning_embeddings(self):
         self.model.eval()        
         with torch.no_grad(), autocast("cuda"), self.model.ema_scope():
             return self.model.get_learned_conditioning(self.prompt)  
     
-    def _build_index_trend_map(self):
+    def _get_prompt_map(self):        
+        tokenized = self.tokenizer(self.prompt,  
+                                   truncation=True, 
+                                   max_length=77, 
+                                   return_length=True,
+                                   return_overflowing_tokens=False, 
+                                   padding="max_length", 
+                                   return_tensors="pt")
+        token_ids = tokenized["input_ids"].squeeze()
+        return [self.tokenizer.decode(id) for id in token_ids]
+    
+    def _get_index_trend_map(self):
         index_token_map = defaultdict(list)
         active_hi_idx = []
         active_low_idx = []
@@ -47,95 +81,147 @@ class ComplexPromptEmbedding:
                 active_low_idx.append(low_idx)
         return index_token_map
 
-    def get_embeddings(self, force=False, verbose=False):
+    def _get_spherical_dist(self, x: torch.Tensor, y: torch.Tensor, reduce: bool=False) -> torch.Tensor:
+        x = F.normalize(x, dim=-1)
+        y = F.normalize(y, dim=-1)
+        dist = (x - y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
+        if reduce:
+            dist = dist.mean()
+        return dist
+
+    def _get_euclidean_dist(self, x: torch.Tensor, y: torch.Tensor, reduce: bool=False) -> torch.Tensor:        
+        dist = (x - y).pow(2).sqrt()
+        if reduce:
+            dist = dist.mean()
+        return dist
+
+    def get_embeddings(self, steps=1, force=False, verbose=False):    
         if self.built or force:
             return self.embeddings
         else:
-            return self.build_embeddings(verbose=verbose)
+            try:
+                return self._build_embeddings(steps=steps, verbose=verbose)
+            except Exception as e:
+                self.log(f"Failed to build embeddings, returning existing embedding:\t{e}")
+                return self.embeddings
 
-    def build_embeddings(self, steps=1, verbose=False):
+    def _build_embeddings(self, steps=1, verbose=False):
         self.built = False
         self.path_history = []
         self.path_embeddings = []
-        self.embeddings = self._raw_embeddings.clone()
+        self.embeddings = self._origin_embeddings.clone()
+        self.path_embeddings.append(self.embeddings)
         for p in self.path:
-            new_embeddings_list = p.apply(self, steps=steps, verbose=verbose)
-            self.path_embeddings += new_embeddings_list
-            new_embeddings = new_embeddings_list[-1]
-            step_edist = ((self.embeddings - new_embeddings) ** 2).sqrt().mean()
-            step_sdist = get_spherical_dist(self.embeddings, new_embeddings).mean()
-            origin_edist = ((self._raw_embeddings - new_embeddings) ** 2).sqrt().mean()
-            origin_sdist = get_spherical_dist(self._raw_embeddings, new_embeddings).mean()
-            self.path_history.append({"prompt": f"{p.prompt.prompt}", 
-                                      "step": {
-                                          "euler_dist": step_edist, 
-                                          "sphere_dist": step_sdist,
-                                      },
-                                      "origin": {
-                                          "euler_dist": origin_edist,
-                                          "sphere_sdist": origin_sdist,
-                                      },
-                                      "sub_prompt_history": p.prompt.path_history})
-            self.embeddings = new_embeddings
+            new_embeddings_list = p.apply(self, 
+                                          steps=steps, 
+                                          verbose=verbose)
+            
+            self._update_history_transform(p, new_embeddings_list)
+            self.embeddings = new_embeddings_list[-1]
         self.built = True
         return self.embeddings
 
-    def add_transform(self, other_prompt, config, transform_cls):
-        self.path.append(transform_cls(other_prompt, config))
-        self.built = False
+    def _update_history_transform(self, other_prompt, new_embeddings_list):
+        self.path_embeddings += new_embeddings_list
+        new_embeddings = new_embeddings_list[-1]
+        step_edist = self._get_euclidean_dist(self.embeddings, new_embeddings, reduce=True)
+        step_sdist = self._get_spherical_dist(self.embeddings, new_embeddings, reduce=True)
+        origin_edist = self._get_euclidean_dist(self._origin_embeddings, new_embeddings, reduce=True)
+        origin_sdist = self._get_spherical_dist(self._origin_embeddings, new_embeddings, reduce=True)
+        self.path_history.append({"prompt": f"{other_prompt.prompt.prompt}", 
+                                    "step": {
+                                        "euler_dist": step_edist, 
+                                        "sphere_dist": step_sdist,
+                                    },
+                                    "origin": {
+                                        "euler_dist": origin_edist,
+                                        "sphere_sdist": origin_sdist,
+                                    },
+                                    "sub_prompt_history": other_prompt.prompt.path_history})    
+        return len(self.path_history)
+
+    def add_transform(self, prompt: ComplexPromptEmbedding, config: dict, transform_cls: AbstractPromptTransform):
+        try:
+            self.path.append(transform_cls(parent=self, 
+                                        prompt=prompt, 
+                                        config=config))
+            self.built = False
+            return True
+        except Exception as e:
+            self.log(f'Failed to add transform: {e}')
+            return False
 
 class CompositionalPromptEmbedding(ComplexPromptEmbedding):
-    def __init__(self, prompt: str, scale: float=1.0, mask=None, model=model):
+    def __init__(self, prompt: str, scale: float=1.0, mask=None, model=model, logger=print):
         super().__init__(prompt, scale=scale, 
                          mask=mask, 
-                         model=model)
+                         model=model,
+                         logger=logger)
         self._conjunctions = []
         self._negations = []
 
-    def get_embeddings(self, force=False, verbose=False):
-        base_embeddings = super().get_embeddings(force=force, verbose=verbose)
+    def _build_embeddings(self, steps=1, verbose=False):
+        base_embeddings = super()._build_embeddings(steps=steps, verbose=verbose)
+        
         if len(self._conjunctions) or len(self._negations):
-            composition = defaultdict(list)
-            composition["and"].append((self.scale, base_embeddings, self.mask))
-            
-            for conj in self._conjunctions:
-                composition["and"].append((conj.scale, conj.get_embeddings(verbose=verbose), conj.mask))
-                if verbose: print(f"[{conj.scale}x]\tCONJUNCTION added: {conj.prompt}")
-                _edist = ((self.embeddings - conj.embeddings) ** 2).sqrt().mean()
-                _sdist = get_spherical_dist(self.embeddings, conj.embeddings).mean()
-                self.path_history.append({"prompt": f"{conj.prompt}", 
-                                          "mode": "conjunction",
-                                          "euler_dist": _edist,
-                                          "sphere_dist": _sdist,})
-            for neg in self._negations:
-                composition["not"].append((neg.scale, neg.get_embeddings(verbose=verbose), neg.mask))
-                if verbose: print(f"[{neg.scale}x]\tNEGATION added: {neg.prompt}")
-                _edist = ((self.embeddings - neg.embeddings) ** 2).sqrt().mean()
-                _sdist = get_spherical_dist(self.embeddings, neg.embeddings).mean()
-                self.path_history.append({"prompt": f"{neg.prompt}", 
-                                          "mode": "negation",
-                                          "euler_dist": _edist,
-                                          "sphere_dist": _sdist,})
-            return composition
+            self.built = False
+            try:
+                composition = defaultdict(list)
+                composition["and"].append((self.scale, base_embeddings, self.mask))
+                
+                for conj in self._conjunctions:
+                    composition["and"].append((conj.scale, conj.get_embeddings(verbose=verbose), conj.mask))
+                    self._update_history_compose(conj, "conjunction", verbose=verbose)
+                    
+                for neg in self._negations:
+                    composition["not"].append((neg.scale, neg.get_embeddings(verbose=verbose), neg.mask))
+                    self._update_history_compose(conj, "negation", verbose=verbose)
+
+                self.built = True
+                return composition
+            except Exception as e:
+                if verbose:
+                    self.log(f"Failed building embeddings:\t{e}")
         else:
             return base_embeddings
+
+    def _update_history_compose(self, p, mode, verbose=False):
+        assert mode in ["conjunction", "negation"]
+        if verbose: 
+            self.log(f"[{p.scale}x]\t{mode.upper()} added: {p.prompt}")
+        _edist = self._get_euclidean_dist(self.embeddings, p.get_embeddings(), reduce=True)
+        _sdist = self._get_spherical_dist(self.embeddings, p.get_embeddings(), reduce=True)
+        self.path_history.append({"prompt": p.prompt, 
+                                "mode": mode,
+                                "euler_dist": _edist,
+                                "sphere_dist": _sdist,})
+        return len(self.path_history)
     
     def add_conjunction(self, prompt: Union[ComplexPromptEmbedding,str], 
                         scale: Union[float,None]=None, 
                         mask: Union[torch.Tensor,np.ndarray,None]=None) -> None:
-        if isinstance(prompt, str):
-            prompt = ComplexPromptEmbedding(prompt, scale=scale, mask=mask, model=self.model)            
-        self._conjunctions.append(prompt)
+        try:
+            if isinstance(prompt, str):
+                prompt = ComplexPromptEmbedding(prompt, scale=scale, mask=mask, model=self.model)            
+            self._conjunctions.append(prompt)
+        except Exception as e:
+            self.log(f'Failed to add conjunction: {e}')
+            return False
 
     def add_negation(self, prompt: Union[ComplexPromptEmbedding,str], 
                      scale: Union[float,None]=None,
                      mask: Union[torch.Tensor,np.ndarray,None]=None) -> None:
-        if isinstance(prompt, str):
-            prompt = ComplexPromptEmbedding(prompt, scale=scale, mask=mask, model=self.model)            
-        self._negations.append(prompt)
+        try:
+            if isinstance(prompt, str):
+                prompt = ComplexPromptEmbedding(prompt, scale=scale, mask=mask, model=self.model)            
+            self._negations.append(prompt)
+        except Exception as e:
+            self.log(f'Failed to add negation: {e}')
+            return False
 
 class AbstractPromptTransform:
-    def __init__(self, prompt: str, config: dict):
+    def __init__(self, parent: ComplexPromptEmbedding, prompt: ComplexPromptEmbedding, config: dict) -> None:
+        self.parent = parent
         self.prompt = prompt
         self.config = config
         self.param_lerp_keys = config['lerp_keys'] if 'lerp_keys' in config else []
