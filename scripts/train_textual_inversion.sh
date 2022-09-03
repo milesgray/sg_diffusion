@@ -1,0 +1,2 @@
+
+python /content/textual_inversion/main.py --base /content/textual_inversion/configs/stable-diffusion/v1-finetune.yaml -t --actual_resume /content/stable-diffusion/models/ldm/stable-diffusion-v1/model.ckpt -n test --data_root /content/imgs --gpus 1 --init-word $1
