@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 
-import diffuson.samplers.util as util
-from diffuson.samplers.registry import register
+import sg.samplers.util as util
+from sg.samplers.registry import register
 
 class DiscreteSchedule(nn.Module):
     """A mapping between continuous noise levels (sigmas) and a list of discrete noise

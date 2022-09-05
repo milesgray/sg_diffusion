@@ -1,5 +1,5 @@
-from .registry import register, make, create, lookup
+from sg.samplers.registry import register, make, create, lookup
 
-import ddim
-import k_diffusion
-import plms
+import sg.samplers.ddim
+import sg.samplers.k_diffusion 
+import sg.samplers.plms
