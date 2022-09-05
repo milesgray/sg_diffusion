@@ -15,7 +15,6 @@ import torch.nn as nn
 import torch.fft as fft
 import torch.nn.functional as F
 
-
 from sg.modules.super_res.util import to_2tuple
 
 class RealFFT2DLayer(nn.Module):
@@ -24,9 +23,7 @@ class RealFFT2DLayer(nn.Module):
         self.fft = partial(fft.rfft2, s=s, dim=dim, norm=norm)
 
     def forward(self, x):
-        f = self.fft(x)
-        h = torch.concat([f.real, f.imag], dim=1)
-        return h
+        return self.fft(x)
 
 class InvRealFFT2DLayer(nn.Module):
     def __init__(self, s=-1, dim=1, norm="backward"):
@@ -36,6 +33,14 @@ class InvRealFFT2DLayer(nn.Module):
     def forward(self, x):
         return self.ifft(x)
 
+class ComplexAct(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, x):    
+        return torch.tanh(torch.abs(x)) * \
+            torch.exp(1.j * torch.angle(x))
+
 class FrequencyBlock(nn.Module):
     def __init__(self, channels, norm="ortho"):
         super().__init__()
@@ -44,13 +49,14 @@ class FrequencyBlock(nn.Module):
         self.conv_head = nn.Sequential(*[
             nn.Conv2d(channels, channels, 
                       kernel_size=3, padding=1),
-            nn.LeakyReLU(),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
         ])
         self.fft_body = nn.Sequential(*[
             RealFFT2DLayer(norm=norm),
-            nn.Conv2d(inner_ch * 2, inner_ch, 
-                      kernel_size=3, padding=1),
-            nn.LeakyReLU(),
+            nn.Conv2d(inner_ch, inner_ch, 
+                      kernel_size=3, padding=1, 
+                      dtype=torch.cfloat),
+            ComplexAct(),
             InvRealFFT2DLayer(norm=norm),
         ])
         self.conv_tail = nn.Conv2d(channels, channels, 
@@ -72,39 +78,24 @@ class SpatialFrequencyBlock(nn.Module):
         self.left_branch = nn.Sequential(*[
             nn.Conv2d(in_channels, in_channels, 
                       kernel_size=3, padding=1),
-            nn.LeakyReLU(),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
             nn.Conv2d(in_channels, in_channels, 
                       kernel_size=3, padding=1),
         ])
 
         self.right_branch = FrequencyBlock(in_channels)
 
-    def forward(self, x, x_size):
-        if len(x.shape) == 3:
-            H, W = x_size
-            B, L, C = x.shape
-            x = x.reshape(B, C, H, W)
+    def forward(self, x):
         # right - fourier branch
         x_freq = self.right_branch(x)
 
         # left - conv branch
-        h_clc = self.left_branch(x)
-        x_spatial = h_clc + x
+        x_spatial = self.left_branch(x) + x
 
         x = torch.concat([x_spatial, x_freq], dim=1)
-        x_sfb = self.conv_out(x)
-        x = x_sfb.view(B, H * W, C)
-        return x
 
-def drop_path(x, drop_prob, training: bool=False):
-    if drop_prob > 0. and training:
-        keep_prob = 1. - drop_prob
-        mask = torch.FloatTensor(x.size(0), 1, 1, 1) \
-            .bernoulli_(keep_prob) \
-                .to(x.device)
-        x.div_(keep_prob)
-        x.mul_(mask)
-    return x
+        return self.conv_out(x)
+
     
 class DropPath(nn.Module):
     def __init__(self, drop_prob):
@@ -121,9 +112,58 @@ class DropPath(nn.Module):
             x /= self.keep_prob
             x *= self.mask
         return x
+class Scale(nn.Module):
+    def __init__(self, init_value=1e-3, requires_grad=True):
+        super().__init__()
+        self.scale = nn.Parameter(
+            torch.FloatTensor([init_value]), 
+            requires_grad=requires_grad)
+
+    def forward(self, x):
+        return x * self.scale
+
+class Balance(nn.Module):
+    def __init__(self, init_value=0.5, requires_grad=True):
+        super().__init__()
+        self.beta = nn.Parameter(
+            torch.FloatTensor([init_value]), 
+            requires_grad=requires_grad)
+
+    def forward(self, x, y):
+        return (x * self.beta) + (y * (1 - self.beta))
+
+class Mix(nn.Module):
+    def __init__(self, init_value=0.5, requires_grad=True):
+        super().__init__()
+        self.beta_x = nn.Parameter(
+            torch.FloatTensor([init_value]), 
+            requires_grad=requires_grad)
+        self.beta_y = nn.Parameter(
+            torch.FloatTensor([init_value]), 
+            requires_grad=requires_grad)
+
+        self.tanh = nn.Tanh()
+ 
+    def forward(self, x, y):
+        x = x * self.tanh(beta_x)
+        y = y * self.tanh(beta_y)
+        return  + (y * self.beta_y)
+
+class Sine(nn.Module):
+    def __init__(self, w0: float = 1.0, learnable=False):
+        super().__init__()
+        self.scale = Scale(w0, requires_grad=learnable)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sin(self.scale(x))
+
 
 class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+    def __init__(self, in_features, 
+                 hidden_features=None, 
+                 out_features=None, 
+                 act_layer=nn.GELU, 
+                 drop=0.):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -132,10 +172,17 @@ class Mlp(nn.Module):
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
 
+        self.fc3 = nn.Linear(hidden_features, hidden_features)
+        self.pact = Sine()
+
+        self.balance = Balance(1.0)
+
     def forward(self, x):
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
+        p = self.pact(self.fc3(x))        
+        x = self.balance(x, p)
         x = self.fc2(x)
         x = self.drop(x)
         return x

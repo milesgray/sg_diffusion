@@ -8,19 +8,99 @@ from diffuson.samplers.util import make_ddim_sampling_parameters, make_ddim_time
     extract_into_tensor
 from diffuson.samplers.registry import register
 
+
 @register("DDIM")
+class DDIMSamplerWrapper:
+    def __init__(self, model, 
+                 batch_size=1,
+                 width=512,
+                 height=512,
+                 z_channels=4, 
+                 scale=5.0, 
+                 use_start_code=False, 
+                 steps=1,
+                 eta=0.0,
+                 temperature=1.0,
+                 seed=-1):
+        self.sampler = DDIMSampler(model)
+        self.batch_size = batch_size
+        self.width = width
+        self.height = height
+        self.z_channels = z_channels
+        self.scale = scale
+        self.use_start_code = use_start_code
+        self.steps = steps
+        self.eta = eta
+        self.temperature = temperature
+        self.seed = seed
+
+    def to_json(self):
+        return {
+            "name": "DDIM",
+            "args": {
+                "batch_size": self.batch_size,
+                "width": self.width,
+                "height": self.height,
+                "z_channels": self.z_channels,
+                "scale": self.scale,
+                "use_start_code": self.use_start_code,
+                "steps": self.steps,
+                "eta": self.eta,
+                "temperature": self.temperature,
+                "seed": self.seed,
+            }
+        }
+    def sample(self, 
+               conditioning: torch.Tensor=None, 
+               unconditional_conditioning: torch.Tensor=None,
+               start_code: torch.Tensor=None):
+        shape = [self.z_channels, self.width // 8, self.height // 8]
+        if self.use_start_code:
+            if start_code is None:
+                start_code = torch.randn((self.batch_size,) + shape)
+        else:
+            start_code = None
+        
+        with torch.no_grad(), autocast("cuda"), model.ema_scope():
+            samples, _ = self.sampler.sample(S=self.steps,
+                                    conditioning=conditioning,
+                                    batch_size=self.batch_size,
+                                    shape=self.shape,
+                                    verbose=self.verbose,
+                                    unconditional_guidance_scale=self.scale,
+                                    unconditional_conditioning=unconditional_conditioning,
+                                    eta=self.eta,
+                                    temperature=self.temperature,
+                                    x_T=start_code)
+        return samples
+
+
 class DDIMSampler:
-    def __init__(self, model, schedule="linear", **kwargs):
+    def __init__(self, model, **kwargs):
         super().__init__()
         self.model = model
         self.ddpm_num_timesteps = model.num_timesteps
-        self.schedule = schedule
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:
             if attr.device != torch.device("cuda"):
                 attr = attr.to(torch.device("cuda"))
         setattr(self, name, attr)
+
+    def _make_timesteps(self, discr_method, num_timesteps, verbose=True):
+        if discr_method == 'uniform':
+            c = self.num_ddpm_timesteps // num_ddim_timesteps
+            ddim_timesteps = np.asarray(list(range(0, self.num_ddpm_timesteps, c)))
+        elif discr_method == 'quad':
+            ddim_timesteps = ((np.linspace(0, np.sqrt(self.num_ddpm_timesteps * .8), num_ddim_timesteps)) ** 2).astype(int)
+        else:
+            raise NotImplementedError(f'There is no ddim discretization method called "{discr_method}"')
+
+        # add one to get the final alpha values right (the ones from first scale to data during sampling)
+        steps_out = ddim_timesteps + 1
+        if verbose:
+            print(f'Selected timesteps for ddim sampler: {steps_out}')
+        return steps_out
 
     def make_schedule(self, ddim_num_steps, ddim_discretize="uniform", ddim_eta=0., verbose=True):
         self.ddim_timesteps = make_ddim_timesteps(ddim_discr_method=ddim_discretize, num_ddim_timesteps=ddim_num_steps,
@@ -52,6 +132,32 @@ class DDIMSampler:
             (1 - self.alphas_cumprod_prev) / (1 - self.alphas_cumprod) * (
                         1 - self.alphas_cumprod / self.alphas_cumprod_prev))
         self.register_buffer('ddim_sigmas_for_original_num_steps', sigmas_for_original_sampling_steps)
+    
+    def validate_conditioning(self, conditioning, batch_size, verbose=False):
+        if conditioning is not None:
+            if isinstance(conditioning, dict):
+                inner = conditioning[list(conditioning.keys())[0]]
+                if isinstance(inner, list):
+                    inner_item = inner[0]
+                    if isinstance(inner_item, tuple):                        
+                        cbs = inner_item[1].shape[0]
+                    elif hasattr(inner_item, "shape"):
+                        cbs = inner_item.shape[0]
+                    else:
+                        cbs = len(inner_item)
+                else:
+                    cbs = inner.shape[0]
+                if cbs != batch_size:
+                    if verbose:
+                        print(f"Warning: Got {cbs} conditionings but batch-size is {batch_size}")
+                    return False
+            else:
+                if conditioning.shape[0] != batch_size:
+                    if verbose:
+                        print(f"Warning: Got {conditioning.shape[0]} conditionings but batch-size is {batch_size}")
+                    return False
+
+        return True
 
     @torch.no_grad()
     def sample(self,
@@ -78,24 +184,17 @@ class DDIMSampler:
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                **kwargs
                ):
-        if conditioning is not None:
-            if isinstance(conditioning, dict):
-                cbs = conditioning[list(conditioning.keys())[0]].shape[0]
-                if cbs != batch_size:
-                    print(f"Warning: Got {cbs} conditionings but batch-size is {batch_size}")
-            else:
-                if conditioning.shape[0] != batch_size:
-                    print(f"Warning: Got {conditioning.shape[0]} conditionings but batch-size is {batch_size}")
-
+        self.validate_conditioning(conditioning=conditioning, batch_size=batch_size, verbose=verbose)
         self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=verbose)
         # sampling
         C, H, W = shape
         size = (batch_size, C, H, W)
-        print(f'Data shape for DDIM sampling is {size}, eta {eta}')
+        if verbose: print(f'Data shape for DDIM sampling is {size}, eta {eta}')
 
         samples, intermediates = self.ddim_sampling(conditioning, size,
                                                     callback=callback,
                                                     img_callback=img_callback,
+                                                    timesteps=self.ddim_timesteps,
                                                     quantize_denoised=quantize_x0,
                                                     mask=mask, x0=x0,
                                                     ddim_use_original_steps=False,
@@ -111,24 +210,24 @@ class DDIMSampler:
         return samples, intermediates
 
     @torch.no_grad()
-    def ddim_sampling(self, cond, shape,
-                      x_T=None, ddim_use_original_steps=False,
-                      callback=None, timesteps=None, quantize_denoised=False,
-                      mask=None, x0=None, img_callback=None, log_every_t=100,
-                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,):
+    def ddim_sampling(self, cond, shape, timesteps,
+                      x_T=None, 
+                      x0=None,
+                      callback=None, 
+                      quantize_denoised=False,
+                      mask=None, 
+                      img_callback=None, 
+                      log_every_t=100,
+                      temperature=1., noise_dropout=0., 
+                      score_corrector=None, corrector_kwargs=None,
+                      unconditional_guidance_scale=1., unconditional_conditioning=None,
+                      verbose=False,):
         device = self.model.betas.device
         b = shape[0]
         if x_T is None:
             img = torch.randn(shape, device=device)
         else:
             img = x_T
-
-        if timesteps is None:
-            timesteps = self.ddpm_num_timesteps if ddim_use_original_steps else self.ddim_timesteps
-        elif timesteps is not None and not ddim_use_original_steps:
-            subset_end = int(min(timesteps / self.ddim_timesteps.shape[0], 1) * self.ddim_timesteps.shape[0]) - 1
-            timesteps = self.ddim_timesteps[:subset_end]
 
         intermediates = {'x_inter': [img], 'pred_x0': [img]}
         time_range = reversed(range(0,timesteps)) if ddim_use_original_steps else np.flip(timesteps)
@@ -228,9 +327,24 @@ class DDIMSampler:
         else:
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
-            c_in = torch.cat([unconditional_conditioning, c])
-            e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
-            e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
+            if isinstance(c, dict):
+                e_t_uncon = self.model.apply_model(x_in, t_in, unconditional_conditioning)
+                e_factors = []
+                if "and" in c:
+                    factors = c["and"]
+                    for factor in factors:                        
+                        e_i = self.model.apply_model(x_in, t_in, factor)
+                        e_factors.append(e_i - e_t_uncon)
+                if "not" in c:
+                    neg_factors = c["not"]
+                    for factor in neg_factors:
+                        e_j = self.model.apply_model(x_in, t_in, factor)
+                        e_factors.append(-negation_factor * (e_j - e_t_uncon))
+                e_t = e_t_uncond + unconditional_guidance_scale * sum(e_factors)
+            else:
+                c_in = torch.cat([unconditional_conditioning, c])
+                e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
+                e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
 
         if score_corrector is not None:
             assert self.model.parameterization == "eps"
