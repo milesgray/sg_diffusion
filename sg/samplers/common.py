@@ -2,6 +2,120 @@ import torch
 from tqdm import trange
 
 
+class DiffusionSamplerWrapper:
+    def __init__(self, name: str, **kwargs):
+        constructor = kwargs.get("constructor", DiffusionSampler)
+        self.sampler = constructor(kwargs.get("model"))
+        self.name = name
+        self.batch_size = kwargs.get("batch_size", 1)
+        self.width = kwargs.get("width", 512)
+        self.height = kwargs.get("height", 512)
+        self.z_channels = kwargs.get("z_channels", 4)
+        self.scale = kwargs.get("scale", 7.5)
+        self.use_start_code = kwargs.get("use_start_code", False)
+        self.steps = kwargs.get("steps", 50)
+        self.eta = kwargs.get("eta", 0)
+        self.temperature = kwargs.get("temperature", 1)
+        self.denoising_strength = kwargs.get("denoising_strength", 0.0)
+
+    def to_json(self):
+        return {
+            "name": self.name,
+            "args": {
+                "batch_size": self.batch_size,
+                "width": self.width,
+                "height": self.height,
+                "z_channels": self.z_channels,
+                "scale": self.scale,
+                "use_start_code": self.use_start_code,
+                "steps": self.steps,
+                "eta": self.eta,
+                "temperature": self.temperature,
+                "denoising_strength": self.denoising_strength,
+            }
+        }
+
+    def sample(self, 
+               conditioning: torch.Tensor=None, 
+               unconditional_conditioning: torch.Tensor=None,
+               start_code: torch.Tensor=None):
+        shape = [self.z_channels, self.width // 8, self.height // 8]
+        if self.use_start_code:
+            if start_code is None:
+                start_code = torch.randn((self.batch_size,) + shape)
+        else:
+            start_code = None
+        
+        with torch.no_grad(), autocast("cuda"), model.ema_scope():
+            result = self.sampler.sample(steps=self.steps,
+                                         conditioning=conditioning,
+                                         batch_size=self.batch_size,
+                                         shape=self.shape,
+                                         verbose=self.verbose,
+                                         unconditional_guidance_scale=self.scale,
+                                         unconditional_conditioning=unconditional_conditioning,
+                                         eta=self.eta,
+                                         temperature=self.temperature,
+                                         x_T=start_code)
+            if isinstance(result, tuple):
+                samples = result[0]
+            else:
+                samples = result
+        return samples
+
+    def sample_img(self, img, mask, 
+                   conditioning=None,    
+                   unconditional_conditioning=None, 
+                   noise=None):
+        self.sampler.make_schedule(num_steps=self.steps, eta=self.eta, verbose=False)
+        
+        with torch.no_grad(), autocast("cuda"), model.ema_scope():
+            t_enc = int(min(self.denoising_strength, 0.999) * self.steps)
+            t = torch.Tensor([t_enc] * int(img.shape[0]))
+
+            x = self.sampler.stochastic_encode(img, t, noise=noise)
+            
+            samples = self.sampler.decode(x, conditioning, t_enc, 
+                                          unconditional_guidance_scale=self.scale,
+                                          unconditional_conditioning=unconditional_conditioning)
+        return samples
+
+class DiffusionSampler:
+    def __init__(self, model):
+        self.model = model
+
+    def make_schedule(self, num_steps, discretize="uniform", eta=0., verbose=True):
+        self.timesteps = num_steps
+    
+    @torch.no_grad()
+    def sample(self, steps, batch_size, shape,
+               conditioning=None,
+               unconditional_guidance_scale=1., unconditional_conditioning=None,
+               x_T=None, mask=None, x0=None,
+               quantize_x0=False,
+               temperature=1., eta=0.,
+               noise_dropout=0.,
+               score_corrector=None, corrector_kwargs=None,
+               callback=None,
+               img_callback=None,
+               verbose=True, log_every_t=100,              
+               **kwargs
+               ):
+            return torch.randn(shape)
+
+    @torch.no_grad()
+    def stochastic_encode(self, x0, t, noise=None):
+        return x0
+
+    @torch.no_grad()
+    def decode(self, x_latent, cond, t_start, 
+               unconditional_guidance_scale=1.0, 
+               unconditional_conditioning=None,
+               mask=None, x0=None,
+               verbose=False):
+
+        return x_latent
+
 class VanillaStableDiffusionSampler:
     def __init__(self, model, constructor):
         self.sampler = constructor(model)

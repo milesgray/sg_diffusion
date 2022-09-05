@@ -5,7 +5,7 @@ import numpy as np
 from tqdm import tqdm
 from functools import partial
 
-from sg.samplers.DDIM import DDIMSampler, DDIMSamplerWrapper
+from sg.samplers.ddim import DDIMSampler, DDIMSamplerWrapper
 from sg.samplers.registry import register
 
 @register("PLMS")

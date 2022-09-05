@@ -1,14 +1,15 @@
 import os
 import time
-import glob
+
 import numpy as np
-import tqdm
+
 import torch
 import torch.nn as nn
 import torch.utils.data as data
 import torch.backends.cudnn as cudnn
-import utils
-from models.unet import DiffusionUNet
+
+import sg.samplers.utils as utils
+from sg.modules.diffusionmodules.unet import UNetModel
 
 
 # This script is adapted from the following repositories
@@ -104,7 +105,7 @@ class DenoisingDiffusion(object):
         self.config = config
         self.device = config.device
 
-        self.model = DiffusionUNet(config)
+        self.model = UNetModel(config)
         self.model.to(self.device)
         self.model = torch.nn.DataParallel(self.model)
 
