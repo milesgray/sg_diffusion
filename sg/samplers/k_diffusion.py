@@ -122,6 +122,10 @@ class KDiffusionSampler:
 def sample_euler(model, x, sigmas, extra_args=None, callback=None, disable=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1.):
     """Implements Algorithm 2 (Euler steps) from Karras et al. (2022)."""
     extra_args = {} if extra_args is None else extra_args
+    c = extra_args["cond"] if "cond" in extra_args else 1
+    uc = extra_args["uncond"] if "uncond" in extra_args else 1
+    scale = extra_args["cond_scale"] if "cond_scale" in extra_args
+    
     s_in = x.new_ones([x.shape[0]])
     for i in trange(len(sigmas) - 1, disable=disable):
         gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
