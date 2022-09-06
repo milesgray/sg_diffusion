@@ -47,16 +47,16 @@ class DiffusionSamplerWrapper:
             start_code = None
         
         with torch.no_grad(), autocast("cuda"), model.ema_scope():
-            result = self.sampler.sample(steps=self.steps,
-                                         conditioning=conditioning,
-                                         batch_size=self.batch_size,
-                                         shape=self.shape,
-                                         verbose=self.verbose,
-                                         unconditional_guidance_scale=self.scale,
-                                         unconditional_conditioning=unconditional_conditioning,
-                                         eta=self.eta,
-                                         temperature=self.temperature,
-                                         x_T=start_code)
+            kwargs = {
+                "conditioning": conditioning,
+                "verbose": self.verbose,
+                "unconditional_guidance_scale": self.scale,
+                "unconditional_conditioning": unconditional_conditioning,
+                "eta": self.eta,
+                "temperature": self.temperature,
+                "x_T": start_code
+            }
+            result = self.sampler.sample(self.steps, self.batch_size, shape, **kwargs)
             if isinstance(result, tuple):
                 samples = result[0]
             else:
@@ -84,35 +84,31 @@ class DiffusionSampler:
     def __init__(self, model):
         self.model = model
 
-    def make_schedule(self, num_steps, discretize="uniform", eta=0., verbose=True):
+    def make_schedule(self, num_steps, **kwargs):
         self.timesteps = num_steps
     
     @torch.no_grad()
-    def sample(self, steps, batch_size, shape,
-               conditioning=None,
-               unconditional_guidance_scale=1., unconditional_conditioning=None,
-               x_T=None, mask=None, x0=None,
-               quantize_x0=False,
-               temperature=1., eta=0.,
-               noise_dropout=0.,
-               score_corrector=None, corrector_kwargs=None,
-               callback=None,
-               img_callback=None,
-               verbose=True, log_every_t=100,              
-               **kwargs
-               ):
-            return torch.randn(shape)
+    def sample(self, steps, batch_size, shape,  **kwargs):
+        self._validate_conditioning(conditioning=conditioning, batch_size=batch_size, verbose=verbose)
+        timesteps = self.make_schedule(num_steps=steps, eta=eta, verbose=verbose)
+        # sampling
+        C, H, W = shape
+        size = (batch_size, C, H, W)
+        if verbose: print(f'Data shape for DDIM sampling is {size}, eta {eta}')
+
+        sampling_output = self._sampling(conditioning, size, timesteps, **kwargs)
+        return sampling_output
 
     @torch.no_grad()
-    def stochastic_encode(self, x0, t, noise=None):
+    def _sampling(self, cond, shape, timesteps, **kwargs):
+        raise NotImplementedError()        
+
+    @torch.no_grad()
+    def stochastic_encode(self, x0, t, **kwargs):
         return x0
 
     @torch.no_grad()
-    def decode(self, x_latent, cond, t_start, 
-               unconditional_guidance_scale=1.0, 
-               unconditional_conditioning=None,
-               mask=None, x0=None,
-               verbose=False):
+    def decode(self, x_latent, cond, t_start, **kwargs):
 
         return x_latent
 
